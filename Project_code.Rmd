@@ -1,0 +1,745 @@
+---
+title: "Comparison of Bayesian Joint Model and Likelihood Joint  Model for Longitudinal and Survival Data, with Application to Oral Cancer Data"
+author: "Jintong YAN"
+date: "2023-02-14"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+library(survminer)
+library(dplyr)
+library(tidyverse)
+library(edgeR)
+library("readxl")
+library(ggplot2)
+library(easyGgplot2)
+library(entropy)
+library(biomaRt)
+library(ggpubr)
+library(JM)
+library("lattice")
+library(latex2exp)
+library(RVAideMemoire)
+theme_set(
+  cowplot::theme_cowplot() + 
+    theme(
+      strip.background = element_blank(), 
+      strip.text = element_text(size = 8),
+      legend.position = 'bottom'
+    )
+)
+knitr::opts_chunk$set(echo = T, fig.height = 5, fig.width = 7, dpi = 300, dev = 'svglite')
+```
+
+# 1 Read Data
+
+## 1.1 Old Data
+
+```{r}
+## read `cancer_old.id`
+cancer_old.id <- read_excel('Data.xlsx', sheet = 'cancer.id') %>%
+  dplyr::rename(study_id = ID, progression = progression_indicator) %>%
+  mutate(lesion_site = factor(
+  lesion_site,
+  levels = c('1', '2'), labels = c('0', '1')
+), obstime = time/12) %>% # change the time to year unit
+  mutate(study_id = as.factor(study_id)) %>%
+  filter(study_id != 2094 & study_id != 3046) %>% ## Lesian_area in these samples are all missing values in cancer_old
+  dplyr::select(-c(cycling, tetraploid))
+cycling_mean_df <- read_excel('Data.xlsx', sheet = 'cancer(cleaned)') %>%
+  dplyr::select(study_id = studyID,cycling = `Cycling (1.25-1.75)`) %>%
+  group_by(study_id) %>%
+  mutate(cycling_mean = mean(cycling, na.rm = TRUE)) %>%
+  ungroup() %>%
+  drop_na() %>%
+  dplyr::select(study_id, cycling_mean) %>%
+  distinct() %>%
+  mutate(study_id = as.factor(study_id))
+cancer_old.id <- cancer_old.id %>% 
+  left_join(cycling_mean_df) %>%
+  mutate(cycling_mean = ifelse(cycling_mean ==0,1,cycling_mean))
+cancer_old.id[is.na(cancer_old.id)] <- 1
+cancer_old.id<- cancer_old.id %>%
+  mutate(log_cycling = log(cycling_mean))
+
+## read `cancer_old`
+cancer_old <- read_excel('Data.xlsx', 
+                         sheet = 'cancer(cleaned)') %>%
+  dplyr::select(-c(1, 3, 5, 7, 15)) %>% 
+  dplyr::rename(study_id = studyID,
+                diploid = `Diploid (0.8-1.2)`,
+                diploid_percent = `Diploid %`,
+                cycling = `Cycling (1.25-1.75)`,
+                cycling_percent = `Cycling %`,
+                tetraploid = `Tetraploid (1.80-2.25)`,
+                tetraploid_percent = `Tetraploid %`,
+                aneuploid_percent = `Aneuploid %`,
+                proliferation = Proliferation,
+                proliferation_percent = `Proliferation %`) %>%
+  mutate(obstime = months/12) %>%
+  mutate(study_id = as.factor(study_id)) %>%
+  group_by(study_id) %>%
+  mutate(Time = max(obstime)) %>%
+  ungroup() %>%
+  dplyr::select(study_id, type, lesion_area, obstime, Time)
+cancer_old <- na.omit(cancer_old)
+```
+
+```{r}
+# study_id means the study_id for patients in the original study, id means the id created later.
+# For the Progressors, 'Time' in cancer_old.id shows when the disease diagnosis.
+cancer_old_p <- cancer_old %>%
+  left_join(cancer_old.id %>% dplyr::select(study_id, obstime.id = obstime), ) %>%
+  mutate(drop = ifelse(obstime.id < obstime, 1, 0)) %>%
+  filter(type == 'Progressors') %>%
+  filter(drop == 0) %>%
+  dplyr::select(-drop)
+
+# For the Non-Progressors, 'obstime' in cancer_old.id always less or equal to obstime.id.
+cancer_old_n <- cancer_old %>%
+  left_join(cancer_old.id %>% dplyr::select(study_id, obstime.id = obstime), ) %>%
+  mutate(drop = ifelse(obstime.id < obstime, 1, 0)) %>%
+  filter(type == 'Non-Progressors') %>%
+  dplyr::select(-drop)
+
+cancer_old <- rbind(cancer_old_p, cancer_old_n) %>% 
+  # left_join(cancer_old.id %>% dplyr::select(study_id)) %>%
+  dplyr::select(-c(Time, obstime.id))
+```
+
+## 1.2 Patient Demografic From New Data
+
+```{r}
+## for cancer_old.id
+cancer.id <- read_excel('NewDataset.xlsx', sheet = 'cancer.id') %>% dplyr::rename(study_id = StudyID, Lesion_risk_site = `Lesion risk site`, Event_time = `Event time`, Other_D =`Other D Lesion present`) %>% 
+  mutate(Time = Event_time/12) %>%
+  mutate(study_id = as.factor(study_id),
+         Lesion_risk_site = as.factor(Lesion_risk_site), 
+         Smoke = as.factor(Smoke), 
+         Alcohol = as.factor(Alcohol),
+         Other_D = as.factor(Other_D),
+         Age  = Age - mean(Age)) #Centering the Age to make interpretation more sensible
+
+cancer_old.id <- cancer_old.id %>%
+  left_join(cancer.id %>% dplyr::select(study_id, Age, Gender, Ethnicity, Smoke, Alcohol, Other_D)) %>%
+  drop_na()
+cancer_old.id$ID <- c(1:37)
+cancer_old.id$ID <- as.factor(cancer_old.id$ID)
+## for cancer_old
+cancer_old <- cancer_old %>%
+  left_join(cancer_old.id %>% dplyr::select(study_id, Age, ID)) %>%
+  drop_na()
+```
+There is no age value for patient 1888 and 1913.
+
+# 2. Longitudinal Analysis
+## 2.1 Plots
+### 2.1.1 Histgram of Lesion Area on Log Scale
+
+```{r}
+pdf("hist_lesion.pdf", width=6, height=5)
+hist_lesion <- hist(log(cancer_old$lesion_area), 
+                    xlab = 'Log10 of the Lesion Area', ylab = 'Frequency',
+                    main = 'The Distribution of Log10 of The Lesion Area')
+dev.off()
+```
+
+### 2.1.2 Longitudinal Trajecy of Lesion Area on Log Scale
+
+```{r}
+cancer_old %>% ggplot(aes(x = obstime, y = log(lesion_area), group = study_id)) +
+  geom_point() +
+  # theme(legend.position="right") +
+  labs(title="Individual Trajectories of (log10) Lesion Area for Patients During Study Period",
+         x ="Years from the Start of the Study", y="log10 of Lesion Area") +
+  facet_wrap(~study_id) +
+  theme_bw()
+ggsave("EDA_Trajectories0.pdf", width=8, height=5)
+
+cancer_old %>%
+  ggplot(aes(x = obstime, y = log(lesion_area), group = study_id, color = type)) +
+  geom_line() +
+  theme(legend.position = "bottom") +
+    labs(title="Trajectories Trend of (log10) Lesion Area for Patients In Study Period",
+         x ="Years from the Start of the Study", y="log10 of Lesion Area") +
+  stat_smooth(aes(group = 1)) +
+  #stat_summary(aes(group = 1), geom = "point", fun.y = mean, shape = 17, size = 3) +
+  facet_grid(. ~ type)
+ggsave("EDA_Trajectories1.pdf", width=8, height=5)
+
+cancer_old %>%
+  ggplot(aes(x = obstime, y = log(lesion_area), group = study_id)) +
+    geom_line(alpha = 0.5, color = "dark blue") +
+    geom_point(alpha = 0.2, size = 0.8) +
+   facet_grid(~ type)+
+    labs(title="Individual Trajectories of (log10) Lesion Area for Patients During Study Period",
+         x ="Years from the Start of the Study", y="log10 of Lesion Area") +
+    theme_bw()
+ggsave("EDA_Trajectories.pdf", width=8, height=5)
+```
+## 2.2 Model Selection
+
+```{r}
+lmeFit1 <- lme(log(lesion_area) ~ obstime, 
+               data = cancer_old, random = ~ 1 | ID)
+lmeFit2 <- lme(log(lesion_area) ~ obstime, 
+               data = cancer_old, random = ~ obstime | ID)
+lmeFit3 <- lme(log(lesion_area) ~ obstime + Age, 
+               data = cancer_old, random = ~ 1 | ID)
+lmeFit4 <- lme(log(lesion_area) ~ obstime + Age, 
+               data = cancer_old, random = ~ obstime | ID)
+lmeFit5 <- lme(log(lesion_area) ~ obstime + I(obstime^2) + Age, 
+               data = cancer_old, random = ~ obstime | ID)
+lmeFit6 <- lme(log(lesion_area) ~ ns(obstime,3)+ Age, data = cancer_old, random = ~ obstime | ID)
+lmeFit7 <- lme(log(lesion_area) ~ ns(obstime,4)+ Age, data = cancer_old, random = ~ obstime | ID)
+m1 <- update(lmeFit1, method = "ML")
+m2 <- update(lmeFit2, method = "ML")
+m3 <- update(lmeFit3, method = "ML")
+m4 <- update(lmeFit4, method = "ML")
+m5 <- update(lmeFit5, method = "ML")
+m6 <- update(lmeFit6, method = "ML")
+m7 <- update(lmeFit7, method = "ML")
+BIC(m1,m2,m3,m4,m5,m6,m7)
+```
+
+## 2.3 Diagnostics
+
+```{r}
+## Residual plot
+pdf("lme_residual.pdf", width=7, height=5)
+plot(lmeFit2, resid(., scaled=TRUE) ~ fitted(.), abline = 0, pch=16, id = 0.1, adj = -0.3,
+     xlab="Fitted values",ylab="Standardised Residuals", main = "Residual Plot of The Linear Mixed Effects Model")
+dev.off()
+
+## Residuals split by random effect groupings
+pdf("lme_residual_boxplot.pdf", width=7, height=6)
+plot(lmeFit2, as.factor(ID) ~ resid(., scaled=TRUE), abline=0, pch=16, 
+     xlab="Standardised Residuals", ylab="ID", main = "Residual Boxplot Splitting by Patients of The Linear Mixed Effects Model") ### Compare the difference in residuals between individuls using boxplots
+dev.off()
+
+##  QQ plot for errors
+pdf("lme_error.pdf", width=7, height=5)
+qqnorm(resid(lmeFit2), pch=16, main = 'QQ Plot for Errors of The Linear Mixed Effects Model')
+qqline(resid(lmeFit2))
+dev.off()
+
+##  QQ plot for random effects
+pdf("lme_ranef.pdf", width=7, height=5)
+qqnorm(lmeFit2, ~ranef(.), id = 0.1, cex = 0.7, main = 'QQ Plot for Random Effects of The Linear Mixed Effects Model')
+dev.off()
+```
+
+## 2.4 Drop 'id=30' and Build the Model
+
+```{r}
+## drop 'id=30'
+cancer_old.id1 <- cancer_old.id %>% 
+  filter(ID != 30) %>%
+  mutate(ID = c(1:36)) %>%
+  mutate(ID = as.factor(ID))
+cancer_old1 <- cancer_old %>%
+  filter(ID != 30) %>%
+  dplyr::select(-ID) %>%
+  left_join(cancer_old.id1 %>% dplyr::select(study_id, ID))
+## build linear mixed-effects model 
+lmeFit <- lme(log(lesion_area) ~ obstime, 
+               data = cancer_old1, random = ~ obstime | ID)
+summary(lmeFit)
+m <- update(lmeFit, method = "ML")
+BIC(m)
+## intervals of fixed and random effects
+intervals(lmeFit)
+## standard errors of random effects
+sqrt(diag(lmeInfo::varcomp_vcov(lmeFit)))
+```
+
+## 2.5 Goodness of Fits
+
+```{r}
+##  lesion area
+cancer_old1 %>%
+  add_column(pred1 = predict(lmeFit)) %>% 
+  filter(ID %in% c(3, 6, 7, 12, 15, 17, 24, 33, 35)) %>%
+  ggplot(aes(x = obstime, y = log(lesion_area), colour = study_id)) +
+  geom_point(size = 0.8) +
+  geom_line(aes(y = pred1)) +
+  facet_wrap(~study_id) +
+  theme_bw() +
+  labs(title="LME Prediction Plot for (log10) Lesion Area on Selected Patients", 
+       x="Year", y="Lesion Area on log10 Scale")
+ggsave("lesion_area_pred.pdf", width=7, height=5)
+```
+
+# 3 Time-to-event Model
+## 3.1 Several Variables Selected in the Survival Model
+
+```{r}
+# Alcohol
+pdf("alcohol.pdf", width=7, height=5)
+plot(survfit(Surv(obstime, progression) ~ Alcohol, data = cancer_old.id), 
+     conf.int = FALSE, mark.time = TRUE, col = c("black", "red"), 
+     lty = 1:2, ylab = "Probability of Survival", xlab = "Years", 
+     main = 'The Probability of Survival for Drinker and Non-drinker Groups')
+legend("topright", c("Non-alcohol", "Alcohol"), lty = 1:2, col = c("black", "red"), bty = "n")
+dev.off()
+
+# Smoke
+pdf("smoke.pdf", width=7, height=5)
+plot(survfit(Surv(obstime, progression) ~ Smoke, data = cancer_old.id), 
+     conf.int = FALSE, mark.time = TRUE, col = c("black", "red"), 
+     lty = 1:2, ylab = "Probability of Survival", xlab = "Years", 
+     main = 'The Probability of Survival for Smoker and Non-smoker Groups')
+legend("topright", c("Non-smoker", "Smoker"), lty = 1:2, col = c("black", "red"), bty = "n")
+dev.off()
+
+# cycling
+cancer_old.id1 %>% 
+  ggplot(aes(x = as.factor(progression), y = log_cycling)) +
+  geom_boxplot() +
+  labs(title="Boxplot for (log10) Cycling on Different Progressions", 
+       x="Type of Progressions", y="Cycling on log10 Scale")
+ggsave("cycling.pdf", width=7, height=5)
+```
+
+## 3.2 Build Model and Model Selection
+
+```{r}
+## Null Model
+coxFit.null <- coxph(Surv(obstime, progression) ~ 1, 
+                     data = cancer_old.id1, x = TRUE, model = TRUE)
+summary(coxFit.null)
+
+## All Model
+coxFit.all <- coxph(Surv(obstime, progression) ~ Alcohol*Smoke + cycling_mean,
+                    data = cancer_old.id1, x = TRUE, model = TRUE)
+summary(coxFit.all)
+anova(coxFit.null, coxFit.all)
+
+## Schoenfeld Residuals Test
+cox.zph(coxFit.all)
+```
+
+# 4 Joint Model with Likelihood Inference
+
+## 4.1 Standard Cox PH Model
+
+```{r}
+cancer_old2 <- cancer_old1 %>%
+  group_by(study_id) %>%
+  mutate(start = min(obstime),
+         stop = max(obstime),
+         progression = ifelse(type == 'Progressors', 1, 0)) %>%
+  ungroup() %>%
+  left_join(cancer_old.id1 %>% dplyr::select(study_id, Alcohol, Smoke, cycling_mean))
+coxFit <- coxph(Surv(start, stop, progression) ~ log(lesion_area), 
+                    data = cancer_old2, x = TRUE, model = TRUE)
+summary(coxFit)
+```
+
+## 4.2 Build Models 
+
+```{r}
+## current value association
+jmFit1 <- jointModel(lmeFit, coxFit.null, timeVar = "obstime", parameterization="value",
+                    method = "piecewise-PH-GH") 
+summary(jmFit1)
+
+## current + slope value association
+dForm <- list(fixed= ~ 1,
+              random = ~ 1, 
+              indFixed = 2, indRandom = 2)
+jmFit2 <-  jointModel(lmeFit, coxFit.null, timeVar = "obstime", 
+                      parameterization="both",
+                      method="piecewise-PH-GH",  derivForm=dForm) 
+summary(jmFit2)
+anova(jmFit1, jmFit2)
+```
+
+## 4.3 Diagnostics
+
+```{r}
+pdf("jointmodel_lmDiagnostics.pdf", width=8, height=8)
+## Diagnostic plots for the fitted joint model
+par(mfrow = c(2, 2))
+plot(jmFit1)
+dev.off()
+```
+
+The top-left panel depicts the subject specific residuals for the longitudinal process versus their corresponding fitted values. The top-right panel depicts the normal Q-Q plot of the standardized subject-specific residuals for the longitudinal process. The bottom-left depicts an estimate of the marginal survival function for the event process. The bottom-right depicts an estimate of the marginal cumulative risk function for the event process.
+
+```{r}
+pdf("jointmodel_lmResiduals.pdf", width=7, height=10)
+plotResid <- function (x, y, ...) {
+  plot(x, y, ...)
+  lines(lowess(x, y), col = "red", lwd = 2)
+  abline(h = 0, lty = 3, col = "grey", lwd = 2)
+}
+
+par(mfrow = c(2, 1))
+resSubY <- residuals(jmFit1, process = "Longitudinal", type = "stand-Marginal")
+fitSubY <- fitted(jmFit1, process = "Longitudinal", type = "Subject")
+plotResid(fitSubY, resSubY, xlab = "Fitted Values", ylab = "Residuals",
+          main = "Subject Specific Residuals vs Fitted Values for Longitudinal Process")
+
+resMargY <- residuals(jmFit1, process = "Longitudinal",
+                      type = "stand-Marginal")
+fitMargY <- fitted(jmFit1, process = "Longitudinal", type = "Marginal")
+plotResid(fitMargY, resMargY, xlab = "Fitted Values", ylab = "Residuals",
+                         main = "Marginal Residuals vs Fitted Values for Longitudinal Process")
+```
+
+# 5 Joint Model with Bayesian Inference
+
+## 5.1 Build Models
+
+```{r}
+## Shared random effects 
+jmbFit_share <- JMbayes::jointModelBayes(lmeFit, coxFit.null, timeVar = "obstime", 
+                                       param = "shared-RE", n.iter = 30000)
+summary(jmbFit_share)
+
+## Current value association
+jmbFit_current <- JMbayes::jointModelBayes(lmeFit, coxFit.null, timeVar = "obstime",
+                                           n.iter = 30000)
+summary(jmbFit_current)
+
+## Current value + Slope association
+dForm <- list(fixed= ~ 1,
+              random = ~ 1, 
+              indFixed = 2, indRandom = 2)
+jmbFit_currentslope <- JMbayes::jointModelBayes(lmeFit, coxFit.null, timeVar = "obstime", 
+                                           n.iter = 50000, param="td-both", extraForm=dForm)
+                                          
+summary(jmbFit_currentslope)
+```
+
+## 5.2 Diagnostics
+
+### 5.2.1 Sensitivity Analysis
+
+#### The Number of the Knots in B-spline
+
+The following displays the results of the sensitivity analysis for shared parameters association using B-splines with varying numbers of knots.
+
+```{r}
+## Shared parameters association
+###  The fixed effects of the longitudinal submodel
+jmbFit_share.11knots <- update(jmbFit_share, lng.in.kn = 11L)
+jmbFit_share.13knots <- update(jmbFit_share, lng.in.kn = 13L)
+jmbFit_share.17knots <- update(jmbFit_share, lng.in.kn = 17L)
+cbind("11 knots" = fixef(jmbFit_share.11knots),
+      "13 knots" = fixef(jmbFit_share.13knots),
+      "15 knots" = fixef(jmbFit_share),
+      "17 knots" = fixef(jmbFit_share.17knots))
+
+###  Regression coefficients of the time-to-event submodel
+cbind("11 knots" = fixef(jmbFit_share.11knots, process = "Event"),
+      "13 knots" = fixef(jmbFit_share.13knots, process = "Event"),
+      "15 knots" = fixef(jmbFit_share, process = "Event"),
+      "17 knots" = fixef(jmbFit_share.17knots, process = "Event"))
+```
+
+The following displays the results of the sensitivity analysis for current value association using B-splines with varying numbers of knots.
+
+```{r}
+## Current value association
+###  The fixed effects of the longitudinal submodel
+jmbFit_current.11knots <- update(jmbFit_current, lng.in.kn = 11L)
+jmbFit_current.13knots <- update(jmbFit_current, lng.in.kn = 13L)
+jmbFit_current.17knots <- update(jmbFit_current, lng.in.kn = 17L)
+cbind("11 knots" = fixef(jmbFit_current.11knots),
+      "13 knots" = fixef(jmbFit_current.13knots),
+      "15 knots" = fixef(jmbFit_current),
+      "17 knots" = fixef(jmbFit_current.17knots))
+
+###  Regression coefficients of the time-to-event submodel
+cbind("11 knots" = fixef(jmbFit_current.11knots, process = "Event"),
+      "13 knots" = fixef(jmbFit_current.13knots, process = "Event"),
+      "15 knots" = fixef(jmbFit_current, process = "Event"),
+      "17 knots" = fixef(jmbFit_current.17knots, process = "Event"))
+```
+
+The following displays the results of the sensitivity analysis for current value plus slope association using B-splines with varying numbers of knots.
+
+```{r}
+## Current value + slope association
+###  The fixed effects of the longitudinal submodel
+jmbFit_currentslope.11knots <- update(jmbFit_currentslope, lng.in.kn = 11L)
+jmbFit_currentslope.13knots <- update(jmbFit_currentslope, lng.in.kn = 13L)
+jmbFit_currentslope.17knots <- update(jmbFit_currentslope, lng.in.kn = 17L)
+cbind("11 knots" = fixef(jmbFit_currentslope.11knots),
+      "13 knots" = fixef(jmbFit_currentslope.13knots),
+      "15 knots" = fixef(jmbFit_currentslope),
+      "17 knots" = fixef(jmbFit_currentslope.17knots))
+
+###  Regression coefficients of the time-to-event submodel
+cbind("11 knots" = fixef(jmbFit_currentslope.11knots, process = "Event"),
+      "13 knots" = fixef(jmbFit_currentslope.13knots, process = "Event"),
+      "15 knots" = fixef(jmbFit_currentslope, process = "Event"),
+      "17 knots" = fixef(jmbFit_currentslope.17knots, process = "Event"))
+```
+
+#### Prior Variance
+
+The following displays the results of the sensitivity analysis for shared parameter association using different prior variances. 
+
+```{r}
+## Shared random parameters Association
+jmbFit_share_10 <- update(jmbFit_share, priorVar = 10)
+jmbFit_share_1000 <- update(jmbFit_share, priorVar = 1000)
+jmbFit_share_10000 <- update(jmbFit_share, priorVar = 10000)
+cbind("priorVar10" = fixef(jmbFit_share_10),
+      "priorVar100" = fixef(jmbFit_share),
+      "priorVar1000" = fixef(jmbFit_share_1000),
+      "priorVar10000" = fixef(jmbFit_share_10000))
+
+###  Regression coefficients of the time-to-event submodel
+cbind("priorVar10" = fixef(jmbFit_share_10, process = "Event"),
+      "priorVar100" = fixef(jmbFit_share, process = "Event"),
+      "priorVar1000" = fixef(jmbFit_share_1000, process = "Event"),
+      "priorVar10000" = fixef(jmbFit_share_10000, process = "Event"))
+```
+
+The following displays the results of the sensitivity analysis for current value association using different prior variances. 
+
+```{r}
+## Current value Association
+jmbFit_current_10 <- update(jmbFit_current, priorVar = 10)
+jmbFit_current_1000 <- update(jmbFit_current, priorVar = 1000)
+jmbFit_current_10000 <- update(jmbFit_current, priorVar = 10000)
+cbind("priorVar10" = fixef(jmbFit_current_10),
+      "priorVar100" = fixef(jmbFit_current),
+      "priorVar1000" = fixef(jmbFit_current_1000),
+      "priorVar10000" = fixef(jmbFit_current_10000))
+
+###  Regression coefficients of the time-to-event submodel
+cbind("priorVar10" = fixef(jmbFit_current_10, process = "Event"),
+      "priorVar100" = fixef(jmbFit_current, process = "Event"),
+      "priorVar1000" = fixef(jmbFit_current_1000, process = "Event"),
+      "priorVar10000" = fixef(jmbFit_current_10000, process = "Event"))
+```
+
+The following displays the results of the sensitivity analysis for current value plus slope association using different prior variances. 
+
+```{r}
+## Current value + Slope Association
+jmbFit_currentslope_10 <- update(jmbFit_currentslope, priorVar = 10)
+jmbFit_currentslope_1000 <- update(jmbFit_currentslope, priorVar = 1000)
+jmbFit_currentslope_10000 <- update(jmbFit_currentslope, priorVar = 10000)
+cbind("priorVar10" = fixef(jmbFit_currentslope_10),
+      "priorVar100" = fixef(jmbFit_currentslope),
+      "priorVar1000" = fixef(jmbFit_currentslope_1000),
+      "priorVar10000" = fixef(jmbFit_currentslope_10000))
+
+###  Regression coefficients of the time-to-event submodel
+cbind("priorVar10" = fixef(jmbFit_currentslope_10, process = "Event"),
+      "priorVar100" = fixef(jmbFit_currentslope, process = "Event"),
+      "priorVar1000" = fixef(jmbFit_currentslope_1000, process = "Event"),
+      "priorVar10000" = fixef(jmbFit_currentslope_10000, process = "Event"))
+```
+
+### 5.2.2 Trace/Autocorrelation/Kernel Density Estimation Plots
+
+#### Shared parameters Association
+
+```{r}
+##  Trace plot for the parameters of the longitudinal submodel and time-to-event submodel
+trace_share <- do.call(cbind, jmbFit_share$mcmc) %>% data.frame() %>%
+  dplyr::select('X.Intercept.', 'obstime', 'Assoct..Intercept.', 'Assoct.obstime')
+n <- nrow(trace_share)
+
+trace_share %>%
+  ggplot(aes(x = seq(1, n), y = X.Intercept.)) +
+  geom_line() +
+  labs(title = TeX('Trace Plot for $\\beta_0$ in the Shared Parameters Association Joint Model'), 
+       x = 'iteration', y = TeX('$\\beta_0$')) +
+  theme_bw()
+ggsave("share_trace_long1.pdf", width = 8, height=5)
+
+trace_share %>%
+  ggplot(aes(x = seq(1, n), y = obstime)) +
+  geom_line() +
+  labs(title = TeX('Trace Plot for $\\beta_1$ in the Shared Parameters Association Joint Model'), 
+       x = 'iteration', y = TeX('$\\beta_1$')) +
+  theme_bw()
+ggsave("share_trace_long2.pdf", width = 8, height = 5)
+
+trace_share %>%
+  ggplot(aes(x = seq(1, n), y = Assoct..Intercept.)) +
+  geom_line() +
+  labs(title = TeX('Trace Plot for $\\alpha_0$ in the Shared Parameters Association Joint Model'), 
+       x = 'iteration', y = TeX('$\\alpha_0$')) +
+  theme_bw()
+ggsave("share_trace_event1.pdf", width = 8, height = 5)
+
+trace_share %>%
+  ggplot(aes(x = seq(1, n), y = Assoct.obstime)) +
+  geom_line() +
+  labs(title = TeX('Trace Plot for $\\alpha_1$ in the Shared Parameters Association Joint Model'), 
+       x = 'iteration', y = TeX('$\\alpha_1$')) +
+  theme_bw()
+ggsave("share_trace_event2.pdf", width = 8, height = 5)
+
+## Autocorrelation plot of the longitudinal submodel and time-to-event submodel
+pdf("share_autocorrelation.pdf", width=8, height=8)
+plot(jmbFit_share, which = 'autocorr', param = c("betas","alphas"))
+dev.off()
+
+##  Kernel density estimation plots for the parameters of the longitudinal (first four plots) 
+##  and time-to-event (last four plots) submodels
+pdf("share_kernel.pdf", width=8, height=8)
+plot(jmbFit_share, which = "density", param = c("betas", "alphas"))
+dev.off()
+```
+
+#### Current Value Association
+
+```{r}
+##  Trace plot for the parameters of the longitudinal submodel and time-to-event submodel
+trace_current <- do.call(cbind, jmbFit_current$mcmc) %>% data.frame() %>%
+  dplyr::select('X.Intercept.', 'obstime', 'Assoct')
+n <- nrow(trace_current)
+
+trace_current %>%
+  ggplot(aes(x = seq(1, n), y = X.Intercept.)) +
+  geom_line() +
+  labs(title = TeX('Trace Plot for $\\beta_0$ in the Current Value Association Joint Model'), 
+       x = 'iteration', y = TeX('$\\beta_0$')) +
+  theme_bw()
+ggsave("current_trace_long1.pdf", width = 8, height=5)
+
+trace_current %>%
+  ggplot(aes(x = seq(1, n), y = obstime)) +
+  geom_line() +
+  labs(title = TeX('Trace Plot for $\\beta_1$ in the Current Value Association Joint Model'), 
+       x = 'iteration', y = TeX('$\\beta_1$')) +
+  theme_bw()
+ggsave("current_trace_long2.pdf", width = 8, height = 5)
+
+trace_current %>%
+  ggplot(aes(x = seq(1, n), y = Assoct)) +
+  geom_line() +
+  labs(title = TeX('Trace Plot for $\\alpha_1$ in the Current Value Association Joint Model'), 
+       x = 'iteration', y = TeX('$\\alpha_1$')) +
+  theme_bw()
+ggsave("current_trace_event1.pdf", width = 8, height = 5)
+
+## Autocorrelation plot of the longitudinal submodel and time-to-event submodel
+pdf("current_autocorrelation.pdf", width = 8, height = 8)
+plot(jmbFit_current, which = 'autocorr', param = c("betas","alphas"))
+dev.off()
+
+##  Kernel density estimation plots for the parameters of the longitudinal (first four plots) 
+##  and time-to-event (last four plots) submodels
+pdf("current_kernel.pdf", width=8, height=8)
+plot(jmbFit_current, which = "density", param = c("betas", "alphas"))
+dev.off()
+```
+
+#### Current Value + Slope Association
+
+```{r}
+##  Trace plot for the parameters of the longitudinal submodel and time-to-event submodel
+trace_currentslope <- do.call(cbind, jmbFit_currentslope$mcmc) %>% data.frame() %>%
+  dplyr::select('X.Intercept.', 'obstime', 'Assoct', 'AssoctE')
+n <- nrow(trace_currentslope)
+
+trace_currentslope %>%
+  ggplot(aes(x = seq(1, n), y = X.Intercept.)) +
+  geom_line() +
+  labs(title = TeX('Trace Plot for $\\beta_0$ in the Current Value Plus Slope Association Joint Model'), 
+       x = 'iteration', y = TeX('$\\beta_0$')) +
+  theme_bw()
+ggsave("currentslope_trace_long1.pdf", width = 8, height=5)
+
+trace_currentslope %>%
+  ggplot(aes(x = seq(1, n), y = obstime)) +
+  geom_line() +
+  labs(title = TeX('Trace Plot for $\\beta_1$ in the Current Value Plus Slope Association Joint Model'), 
+       x = 'iteration', y = TeX('$\\beta_1$')) +
+  theme_bw()
+ggsave("currentslope_trace_long2.pdf", width = 8, height=5)
+
+trace_currentslope %>%
+  ggplot(aes(x = seq(1, n), y = Assoct)) +
+  geom_line() +
+  labs(title = TeX('Trace Plot for $\\alpha_1$ in the Current Value Plus Slope Association Joint Model'), 
+       x = 'iteration', y = TeX('$\\alpha_1$')) +
+  theme_bw()
+ggsave("currentslope_trace_event1.pdf", width = 8, height=5)
+
+trace_currentslope %>%
+  ggplot(aes(x = seq(1, n), y = AssoctE)) +
+  geom_line() +
+  labs(title = TeX('Trace Plot for $\\alpha_2$ in the Current Value Plus Slope Association Joint Model'), 
+       x = 'iteration', y = TeX('$\\alpha_2$')) +
+  theme_bw()
+ggsave("currentslope_trace_event2.pdf", width = 8, height=5)
+
+## autocorrelation plot of the longitudinal submodel and time-to-event submodel
+pdf("currentslope_autocorrelation.pdf", width=8, height=8)
+plot(jmbFit_currentslope, which = 'autocorr', param = c("betas","alphas", "Dalphas"))
+dev.off()
+
+##  Kernel density estimation plots for the parameters of the longitudinal (first four plots) 
+##  and time-to-event (last four plots) submodels
+pdf("currentslope_kernel.pdf", width=8, height=8)
+plot(jmbFit_currentslope, which = "density", param = c("betas", "alphas", "Dalphas"))
+dev.off()
+```
+
+### 5.2.3 Residual Plots
+#### Shared Parameters Association
+
+```{r}
+## Residuals for longitudinal process-->Subject Specific Residuals vs Fitted Values
+par(mfrow = c(3, 1))
+## shared parameters association
+resSubY1 <- residuals(jmbFit_share, process = "Longitudinal", type = "Subject", 
+                      standardized = TRUE)
+fitSubY1 <- fitted(jmbFit_share, process = "Longitudinal", type = "Subject")
+summary(fitSubY1)
+plotResid(fitSubY1, resSubY1, xlab = "Fitted Values", ylab = "Residuals",
+          main = "Subject Specific Residuals vs Fitted Values", xlim = c(5.3, 8.8))
+## current value association
+resSubY2 <- residuals(jmbFit_current, process = "Longitudinal",type = "Subject", 
+                      standardized = TRUE)
+fitSubY2 <- fitted(jmbFit_current, process = "Longitudinal", type = "Subject")
+summary(fitSubY2)
+plotResid(fitSubY2, resSubY2, xlab = "Fitted Values", ylab = "Residuals",
+          main = "Subject Specific Residuals vs Fitted Values", xlim = c(5.3, 11))
+## current value + slope association
+resSubY3 <- residuals(jmbFit_currentslope, process = "Longitudinal", type = "Subject",
+                      standardized = TRUE)
+fitSubY3 <- fitted(jmbFit_currentslope, process = "Longitudinal", type = "Subject")
+summary(fitSubY3)
+plotResid(fitSubY3, resSubY3, xlab = "Fitted Values", ylab = "Residuals",
+          main = "Subject Specific Residuals vs Fitted Values", xlim = c(0, 6))
+```
+
+
+```{r}
+## calculates the cumulative hazard function at each time point a longitudinal measurement has been recorded
+resMargY1 <- residuals(jmbFit_share, process = "Event")
+fitMargY1 <- fitted(jmbFit_share, process = "Event")
+plotResid(fitMargY1, resMargY1, xlab = "Fitted Values", ylab = "Residuals",
+                         main = "Marginal Residuals vs Fitted Values")
+
+resMargY2 <- residuals(jmbFit_current, process = "Event")
+fitMargY2 <- fitted(jmbFit_current, process = "Event")
+plotResid(fitMargY2, resMargY2, xlab = "Fitted Values", ylab = "Residuals",
+                         main = "Marginal Residuals vs Fitted Values")
+
+resMargY3 <- residuals(jmbFit_currentslope, process = "Event")
+fitMargY3 <- fitted(jmbFit_currentslope, process = "Event")
+plotResid(fitMargY3, resMargY3, xlab = "Fitted Values", ylab = "Residuals",
+                         main = "Marginal Residuals vs Fitted Values")
+
+```
+
+# 6 Models Comparision
+
+```{r}
+anova(jmbFit_share, jmbFit_current, jmbFit_currentslope)
+anova(jmFit1, jmFit2)
+```
